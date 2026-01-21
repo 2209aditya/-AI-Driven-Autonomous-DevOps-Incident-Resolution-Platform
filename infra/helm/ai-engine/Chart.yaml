@@ -1,0 +1,14 @@
+apiVersion: v2
+name: ai-engine
+description: AI-Driven DevOps Platform - Core Engine
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - ai
+  - devops
+  - aiops
+  - kubernetes
+maintainers:
+  - name: DevOps Team
+    email: devops@company.com

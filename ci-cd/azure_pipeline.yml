@@ -1,0 +1,313 @@
+# ci-cd/azure-pipelines.yml
+# Azure DevOps CI/CD Pipeline for AI-Driven DevOps Platform
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    exclude:
+      - docs/*
+      - README.md
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: aiops-secrets  # Azure DevOps variable group
+  - name: dockerRegistryServiceConnection
+    value: 'aiops-acr'
+  - name: imageRepository
+    value: 'aiops/ai-engine'
+  - name: containerRegistry
+    value: 'aiopsacr.azurecr.io'
+  - name: dockerfilePath
+    value: '$(Build.SourcesDirectory)/ai-engine/Dockerfile'
+  - name: tag
+    value: '$(Build.BuildId)'
+  - name: kubernetesServiceConnection
+    value: 'aiops-aks'
+  - name: namespace
+    value: 'production'
+
+stages:
+  # Stage 1: Build and Test
+  - stage: Build
+    displayName: 'Build and Test'
+    jobs:
+      - job: UnitTests
+        displayName: 'Run Unit Tests'
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.9'
+            displayName: 'Use Python 3.9'
+
+          - script: |
+              cd ai-engine
+              pip install -r requirements.txt
+              pip install pytest pytest-cov
+            displayName: 'Install dependencies'
+
+          - script: |
+              cd ai-engine
+              pytest tests/unit/ --cov=. --cov-report=xml --cov-report=html -v
+            displayName: 'Run unit tests with coverage'
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFiles: '**/test-*.xml'
+              testRunTitle: 'Python Unit Tests'
+
+          - task: PublishCodeCoverageResults@1
+            inputs:
+              codeCoverageTool: 'Cobertura'
+              summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/coverage.xml'
+
+      - job: SecurityScan
+        displayName: 'Security Scanning'
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.9'
+
+          - script: |
+              pip install bandit safety
+              bandit -r ai-engine/ -f json -o bandit-report.json
+              safety check --json > safety-report.json
+            displayName: 'Run security scans'
+            continueOnError: true
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(Build.SourcesDirectory)'
+              ArtifactName: 'security-reports'
+
+      - job: BuildDocker
+        displayName: 'Build Docker Image'
+        dependsOn: 
+          - UnitTests
+          - SecurityScan
+        steps:
+          - task: Docker@2
+            displayName: 'Build and Push Docker Image'
+            inputs:
+              command: 'buildAndPush'
+              repository: $(imageRepository)
+              dockerfile: $(dockerfilePath)
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(tag)
+                latest
+
+  # Stage 2: Deploy to Staging
+  - stage: DeployStaging
+    displayName: 'Deploy to Staging'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+    jobs:
+      - deployment: DeployStaging
+        displayName: 'Deploy to Staging Environment'
+        environment: 'staging'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: HelmDeploy@0
+                  displayName: 'Helm upgrade'
+                  inputs:
+                    connectionType: 'Kubernetes Service Connection'
+                    kubernetesServiceConnection: $(kubernetesServiceConnection)
+                    namespace: 'staging'
+                    command: 'upgrade'
+                    chartType: 'FilePath'
+                    chartPath: '$(Pipeline.Workspace)/helm/ai-engine'
+                    releaseName: 'ai-engine'
+                    overrideValues: |
+                      image.repository=$(containerRegistry)/$(imageRepository)
+                      image.tag=$(tag)
+                      env=staging
+                    install: true
+                    waitForExecution: true
+
+                - script: |
+                    kubectl rollout status deployment/ai-engine -n staging --timeout=5m
+                  displayName: 'Wait for deployment'
+
+                - script: |
+                    # Run smoke tests
+                    curl -f http://ai-engine.staging.svc.cluster.local:8000/health || exit 1
+                  displayName: 'Smoke tests'
+
+  # Stage 3: Integration Tests
+  - stage: IntegrationTests
+    displayName: 'Integration Tests'
+    dependsOn: DeployStaging
+    jobs:
+      - job: APITests
+        displayName: 'API Integration Tests'
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.9'
+
+          - script: |
+              pip install -r tests/requirements.txt
+              pytest tests/integration/ -v --html=report.html
+            displayName: 'Run integration tests'
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFiles: '**/test-results.xml'
+              testRunTitle: 'Integration Tests'
+
+  # Stage 4: AI Model Validation
+  - stage: AIValidation
+    displayName: 'AI Model Validation'
+    dependsOn: IntegrationTests
+    jobs:
+      - job: ModelTests
+        displayName: 'Validate ML Models'
+        steps:
+          - script: |
+              python ai-engine/anomaly-detection/validate_model.py
+            displayName: 'Validate anomaly detection model'
+
+          - script: |
+              python tests/validate_llm_prompts.py
+            displayName: 'Validate LLM prompts'
+
+  # Stage 5: Deploy to Production
+  - stage: DeployProduction
+    displayName: 'Deploy to Production'
+    dependsOn: AIValidation
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployProduction
+        displayName: 'Deploy to Production Environment'
+        environment: 'production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Blue-Green Deployment Strategy
+                - task: HelmDeploy@0
+                  displayName: 'Deploy Green (new version)'
+                  inputs:
+                    connectionType: 'Kubernetes Service Connection'
+                    kubernetesServiceConnection: $(kubernetesServiceConnection)
+                    namespace: $(namespace)
+                    command: 'upgrade'
+                    chartType: 'FilePath'
+                    chartPath: '$(Pipeline.Workspace)/helm/ai-engine'
+                    releaseName: 'ai-engine-green'
+                    overrideValues: |
+                      image.repository=$(containerRegistry)/$(imageRepository)
+                      image.tag=$(tag)
+                      env=production
+                      color=green
+                      replicas=5
+                    install: true
+                    waitForExecution: true
+
+                - script: |
+                    # Wait for green deployment to be healthy
+                    kubectl rollout status deployment/ai-engine-green -n $(namespace) --timeout=10m
+                  displayName: 'Wait for green deployment'
+
+                - script: |
+                    # Run production smoke tests
+                    for i in {1..5}; do
+                      curl -f http://ai-engine-green.$(namespace).svc.cluster.local:8000/health && break
+                      sleep 10
+                    done
+                  displayName: 'Smoke tests on green'
+
+                - task: Kubernetes@1
+                  displayName: 'Switch traffic to green'
+                  inputs:
+                    connectionType: 'Kubernetes Service Connection'
+                    kubernetesServiceConnection: $(kubernetesServiceConnection)
+                    namespace: $(namespace)
+                    command: 'apply'
+                    useConfigurationFile: true
+                    configuration: |
+                      apiVersion: v1
+                      kind: Service
+                      metadata:
+                        name: ai-engine
+                      spec:
+                        selector:
+                          app: ai-engine
+                          color: green
+
+                - script: |
+                    # Monitor for 5 minutes
+                    sleep 300
+                    # Check error rate
+                    ERROR_RATE=$(kubectl exec -n $(namespace) prometheus-0 -- \
+                      promtool query instant 'rate(http_requests_total{status=~"5.."}[5m])' | \
+                      jq -r '.data.result[0].value[1]')
+                    
+                    if (( $(echo "$ERROR_RATE > 0.01" | bc -l) )); then
+                      echo "Error rate too high, rolling back"
+                      exit 1
+                    fi
+                  displayName: 'Monitor new version'
+
+                - task: HelmDeploy@0
+                  displayName: 'Remove old blue deployment'
+                  condition: succeeded()
+                  inputs:
+                    connectionType: 'Kubernetes Service Connection'
+                    kubernetesServiceConnection: $(kubernetesServiceConnection)
+                    namespace: $(namespace)
+                    command: 'delete'
+                    releaseName: 'ai-engine-blue'
+
+  # Stage 6: Post-Deployment
+  - stage: PostDeploy
+    displayName: 'Post-Deployment Tasks'
+    dependsOn: DeployProduction
+    jobs:
+      - job: NotifyTeam
+        displayName: 'Notify Team'
+        steps:
+          - task: InvokeRESTAPI@1
+            displayName: 'Send Slack notification'
+            inputs:
+              connectionType: 'connectedServiceName'
+              serviceConnection: 'slack-webhook'
+              method: 'POST'
+              body: |
+                {
+                  "text": "✅ AI DevOps Platform deployed to production",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": "*Deployment Successful*\nVersion: $(tag)\nEnvironment: Production"
+                      }
+                    }
+                  ]
+                }
+
+      - job: UpdateDocs
+        displayName: 'Update Documentation'
+        steps:
+          - script: |
+              # Generate API documentation
+              python scripts/generate_api_docs.py
+              # Update version in README
+              sed -i "s/Version: .*/Version: $(tag)/" README.md
+            displayName: 'Update documentation'
+
+          - script: |
+              git config user.email "ci@aiops.com"
+              git config user.name "Azure DevOps"
+              git add docs/ README.md
+              git commit -m "docs: update for version $(tag)" || true
+              git push origin main || true
+            displayName: 'Commit documentation updates'

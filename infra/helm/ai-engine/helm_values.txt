@@ -1,0 +1,213 @@
+# infra/helm/ai-engine/values.yaml
+# Helm values for AI Engine deployment
+
+replicaCount: 3
+
+image:
+  repository: aiopsacr.azurecr.io/aiops/ai-engine
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations:
+    azure.workload.identity/client-id: "your-managed-identity-client-id"
+  name: "ai-engine"
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8000"
+  prometheus.io/path: "/metrics"
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+
+service:
+  type: ClusterIP
+  port: 8000
+  targetPort: 8000
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+  hosts:
+    - host: aiops-api.yourdomain.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: aiops-tls
+      hosts:
+        - aiops-api.yourdomain.com
+
+resources:
+  limits:
+    cpu: 2000m
+    memory: 4Gi
+  requests:
+    cpu: 1000m
+    memory: 2Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+nodeSelector:
+  nodepool-type: applications
+
+tolerations: []
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - ai-engine
+          topologyKey: kubernetes.io/hostname
+
+# Environment variables
+env:
+  - name: ENVIRONMENT
+    value: "production"
+  - name: LOG_LEVEL
+    value: "INFO"
+  - name: PROMETHEUS_URL
+    value: "http://prometheus-server.monitoring.svc.cluster.local"
+  - name: LOKI_URL
+    value: "http://loki.monitoring.svc.cluster.local:3100"
+
+# Secrets (from Azure Key Vault via CSI driver)
+envFrom:
+  - secretRef:
+      name: ai-engine-secrets
+
+# Volume mounts for models
+volumeMounts:
+  - name: models
+    mountPath: /app/models
+    readOnly: true
+  - name: tmp
+    mountPath: /tmp
+
+volumes:
+  - name: models
+    persistentVolumeClaim:
+      claimName: ai-models-pvc
+  - name: tmp
+    emptyDir: {}
+
+# Liveness and readiness probes
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# PersistentVolumeClaim for ML models
+persistence:
+  enabled: true
+  storageClass: "managed-premium"
+  accessMode: ReadOnlyMany
+  size: 10Gi
+
+# ConfigMap for application config
+configMap:
+  data:
+    config.yaml: |
+      llm:
+        provider: azure_openai
+        model: gpt-4
+        temperature: 0.2
+        max_tokens: 2000
+      
+      anomaly_detection:
+        model_type: isolation_forest
+        contamination: 0.02
+        retrain_interval_hours: 24
+      
+      remediation:
+        auto_approve_threshold: 0.85
+        dry_run: false
+        require_human_approval:
+          - severity: critical
+            environment: production
+
+# ServiceMonitor for Prometheus
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  path: /metrics
+  labels:
+    prometheus: kube-prometheus
+
+# PodDisruptionBudget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+# NetworkPolicy
+networkPolicy:
+  enabled: true
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            name: monitoring
+      - namespaceSelector:
+          matchLabels:
+            name: production
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    - to:
+      - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 9090  # Prometheus
+        - protocol: TCP
+          port: 3100  # Loki
